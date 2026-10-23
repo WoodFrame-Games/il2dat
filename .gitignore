@@ -1,0 +1,9 @@
+build/
+*.log
+*.err
+out/
+out_*/
+final*/
+*.o
+*.obj
+__pycache__/
