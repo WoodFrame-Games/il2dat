@@ -37,6 +37,14 @@ static const u32 kTargetSizes[] = {
 struct EmuHooks {
     static void code(uc_engine* uc, uint64_t address, uint32_t, void* ud) {
         Emulator* e = (Emulator*)ud;
+        if (e->traceCount_ > 0) {
+            --e->traceCount_;
+            auto hn = e->handlerNames_.find(address);
+            if (hn != e->handlerNames_.end())
+                std::fprintf(stderr, "[trace] %llx %s\n", (unsigned long long)address, hn->second.c_str());
+            else
+                std::fprintf(stderr, "[trace] %llx\n", (unsigned long long)address);
+        }
         if (address >= Emulator::HAND && address < Emulator::HAND + Emulator::HAND_SIZE)
             e->doImport(address);
     }
@@ -231,7 +239,9 @@ void Emulator::doImport(u64 addr) {
         if (n) {
             if (uc_mem_read(uc_, src, data.data(), n) == UC_ERR_OK) {
                 uc_mem_write(uc_, dst, data.data(), n);
-                if (n >= 0x100) { chunks_.push_back({src, dst, n}); seenSizes_.insert(n); }
+                if (n >= 0x100) { chunks_.push_back({src, dst, n}); seenSizes_.insert(n);
+                if (verbose_) std::fprintf(stderr, "[emu] memcpy n=%#llx dst=%#llx src=%#llx\n",
+                                     (unsigned long long)n, (unsigned long long)dst, (unsigned long long)src); }
             }
         }
         setRet(dst);
@@ -253,12 +263,21 @@ void Emulator::doImport(u64 addr) {
     if (name == "fopen") {
         std::string p = readStr(a0), mode = readStr(a1);
         std::vector<u8> data;
+        if (verbose_) std::fprintf(stderr, "[emu] fopen(%s, %s)\n", p.c_str(), mode.c_str());
         if (p.size() >= 12 && p.compare(p.size() - 12, 12, "libil2cpp.so") == 0) data = elf_.data;
         else if (p.find("global-metadata.dat") != std::string::npos) {
             if (ph5Index_ >= 0) {
                 u64 b = mapped_[ph5Index_].first, e = mapped_[ph5Index_].second.first;
                 data.resize((size_t)(e - b));
                 uc_mem_read(uc_, b, data.data(), e - b);
+                if (verbose_) {
+                    u32 magic = data.size() >= 8 ? rd32(data.data()) : 0;
+                    u32 ver = data.size() >= 8 ? rd32(data.data() + 4) : 0;
+                    std::fprintf(stderr, "[emu] served PH5 as metadata: size=%zu magic=%#x ver=%u\n",
+                                 data.size(), magic, ver);
+                }
+            } else if (verbose_) {
+                std::fprintf(stderr, "[emu] PH5 not mapped, serving empty metadata\n");
             }
         } else if (p.find("status") != std::string::npos) {
             data.assign((const u8*)kStatus, (const u8*)kStatus + std::strlen(kStatus));
@@ -489,6 +508,9 @@ void Emulator::handleSvc(u64 intno) {
         if (a2 & 1) prot |= UC_PROT_READ;
         if (a2 & 2) prot |= UC_PROT_WRITE;
         if (a2 & 4) prot |= UC_PROT_EXEC;
+        if (verbose_)
+            std::fprintf(stderr, "[emu] mprotect(addr=%#llx len=%#llx prot=%d)\n",
+                         (unsigned long long)a0, (unsigned long long)a1, (int)a2);
         uc_mem_protect(uc_, pageAlign(a0), pageUp(a1), prot);
         if (a0 == opt_.initTrigger) doInit_ = true;
         r = 0;
@@ -534,6 +556,7 @@ void Emulator::handleSvc(u64 intno) {
         writeReg(UC_ARM64_REG_LR, TRAP);
         writeReg(UC_ARM64_REG_PC, opt_.il2cppInit);
         if (verbose_) std::fprintf(stderr, "[emu] call il2cpp_init\n");
+        if (verbose_) traceCount_ = 400;
     }
 }
 
@@ -541,6 +564,35 @@ bool Emulator::isTargetChunksComplete(const Emulator& e) {
     for (u32 s : kTargetSizes)
         if (!e.seenSizes_.count(s)) return false;
     return true;
+}
+
+// Ищем в куче готовый образ global-metadata (v31): magic + версия + валидный заголовок.
+// Возвращает смещение в куче или (u64)-1.
+u64 Emulator::findMetadataInHeap() const {
+    std::vector<u8> heap(HEAP_SIZE);
+    if (uc_mem_read(uc_, HEAP, heap.data(), HEAP_SIZE) != UC_ERR_OK) return (u64)-1;
+    const u8 pat[4] = {0xAF, 0x1B, 0xB1, 0xFA};
+    for (size_t i = 0; i + 0x100 < heap.size(); ++i) {
+        if (heap[i] != pat[0] || heap[i + 1] != pat[1] || heap[i + 2] != pat[2] || heap[i + 3] != pat[3])
+            continue;
+        if (rd32(heap.data() + i + 4) != 31) {
+            // версия может быть 31.x; допускаем 31..39
+            u32 v = rd32(heap.data() + i + 4);
+            if (v < 31 || v > 39) continue;
+        }
+        u64 total = 0;
+        bool ok = true;
+        for (int s = 0; s < 31; ++s) {
+            u32 off = rd32(heap.data() + i + 8 + s * 8);
+            u32 sz = rd32(heap.data() + i + 8 + s * 8 + 4);
+            if (sz && (off < 0x100 || (u64)off + sz > 0x8000000ull)) { ok = false; break; }
+            if (sz) total = std::max<u64>(total, (u64)off + sz);
+        }
+        if (!ok || total < 0x100000 || total > 0x8000000ull) continue;
+        if (i + total > heap.size()) continue;
+        return (u64)i;
+    }
+    return (u64)-1;
 }
 
 // ---------------------------------------------------------------------------
@@ -579,16 +631,69 @@ void Emulator::mainLoop() {
     };
 
     u64 pc = entry;
+    u64 lastPc = 0;
+    int sameCount = 0;
+    int probeTick = 0;
     while (now() - t0_ < opt_.maxSeconds) {
         uc_err err = uc_emu_start(uc_, pc, 0, 30'000'000, 20'000'000);
         pc = readReg(UC_ARM64_REG_PC);
         if (verbose_)
             std::fprintf(stderr, "[emu] progress pc=%s imported=%d elapsed=%.1fs\n", hex(pc).c_str(),
                          (int)importCount_.size(), now() - t0_);
+        if ((pc & ~0xFFFull) == (lastPc & ~0xFFFull)) {
+            if (++sameCount >= 20) {
+                std::fprintf(stderr, "[emu] STUCK at pc=%s\n", hex(pc).c_str());
+                static const int regs[] = {UC_ARM64_REG_X0,  UC_ARM64_REG_X1,  UC_ARM64_REG_X2,
+                                           UC_ARM64_REG_X3,  UC_ARM64_REG_X4,  UC_ARM64_REG_X5,
+                                           UC_ARM64_REG_X8,  UC_ARM64_REG_X9,  UC_ARM64_REG_X10,
+                                           UC_ARM64_REG_X11, UC_ARM64_REG_X12, UC_ARM64_REG_X13,
+                                           UC_ARM64_REG_X19, UC_ARM64_REG_X20, UC_ARM64_REG_SP};
+                {
+                    u64 x19v = readReg(UC_ARM64_REG_X19);
+                    u8 q[0x80] = {0};
+                    if (uc_mem_read(uc_, x19v - 0x10, q, sizeof(q)) == UC_ERR_OK) {
+                        std::fprintf(stderr, "   [x19-0x10..] =");
+                        for (int k = 0; k < 16; ++k) std::fprintf(stderr, " %s", hex(rd64(q + k * 8)).c_str());
+                        std::fprintf(stderr, "\n");
+                        float lf = 0; std::memcpy(&lf, q + 0x20, 4);
+                        std::fprintf(stderr, "   [x19+0x10] as float = %g\n", (double)lf);
+                    }
+                }
+                for (int r : regs) {
+                    u64 v = readReg(r);
+                    std::fprintf(stderr, "   reg %d = %s", r, hex(v).c_str());
+                    // пробуем прочитать до 8 qword по указателю, если он в куче/сегментах
+                    if (v >= 0x30000000 && v < 0x40000000) {
+                        u64 buf[8] = {0};
+                        if (uc_mem_read(uc_, v, buf, sizeof(buf)) == UC_ERR_OK) {
+                            std::fprintf(stderr, "  [");
+                            for (int k = 0; k < 8; ++k) std::fprintf(stderr, " %s", hex(buf[k]).c_str());
+                            std::fprintf(stderr, " ]");
+                        }
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+                sameCount = 0;
+            }
+        } else {
+            lastPc = pc;
+            sameCount = 0;
+        }
         if (err != UC_ERR_OK && err != UC_ERR_INSN_INVALID) {
             // errors such as unmapped-fetch are handled by hooks (which set stop_)
         }
         if (isTargetChunksComplete(*this)) { if (verbose_) std::fprintf(stderr, "[emu] metadata chunks complete (%.1fs)\n", now() - t0_); break; }
+        // динамический стоп: ищем готовый образ метадаты в куче
+        if (++probeTick >= 4) {
+            probeTick = 0;
+            u64 mbase = findMetadataInHeap();
+            if (mbase != (u64)-1) {
+                if (verbose_)
+                    std::fprintf(stderr, "[emu] metadata image in heap at %s (%.1fs)\n",
+                                 hex(HEAP + mbase).c_str(), now() - t0_);
+                break;
+            }
+        }
         if (pc == TRAP || stop_) break;
     }
     if (verbose_) std::fprintf(stderr, "[emu] stopped pc=%s\n", hex(pc).c_str());

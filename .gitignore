@@ -1,4 +1,6 @@
 build/
+dist2/
+dist_orig/
 *.log
 *.err
 out/

@@ -7,7 +7,7 @@
 namespace hd {
 
 static constexpr u64 kHeapBase = 0x30000000;
-static constexpr u64 META_REG = 0x3634138;
+static u64 META_REG = 0x3634138;      // переопределяется findMetadataRegistration()
 static constexpr u64 CODREG = 0x60000000;
 static constexpr u64 PTR_ARR_FAKE = 0x60000100;
 static constexpr u64 MOD_FAKE = 0x60001000;
@@ -18,11 +18,13 @@ static constexpr u64 ARR = 0x60000200;
 static constexpr u64 SYM = 0x60050000;
 static constexpr u64 STR = 0x60090000;
 static constexpr u64 BOUND = 0x60080000;
-static constexpr u64 GENERIC_BASE = 0x308D4000;
-static constexpr u64 GENERIC_SIZE = 0xB2F0;
+static constexpr u64 GENERIC_BASE_DEF = 0x308D4000;
+static constexpr u64 GENERIC_SIZE_DEF = 0xB2F0;
+static u64 GENERIC_BASE = GENERIC_BASE_DEF;
+static u64 GENERIC_SIZE = GENERIC_SIZE_DEF;
 
 // ---------------------------------------------------------------------------
-// runtime reader (emulated heap + library segments)
+// поиск Il2CppMetadataRegistration в runtime-образе (без версионных констант)
 // ---------------------------------------------------------------------------
 namespace {
 struct RtReader {
@@ -87,6 +89,87 @@ std::vector<size_t> findAll(const u8* hay, size_t hn, const u8* needle, size_t n
     return out;
 }
 }  // namespace
+
+static bool looksLikeType(const EmuResult& res, u64 tp, u32& typ) {
+    RtReader rt(res);
+    std::vector<u8> d;
+    if (!rt.read(tp, 12, d)) return false;
+    typ = (rd32(d.data() + 8) >> 16) & 0xFF;
+    return typ >= 1 && typ <= 0x1F;
+}
+
+static u64 findMetadataRegistration(const EmuResult& res, const Metadata& meta) {
+    RtReader rt(res);
+    // выборка byvalTypeIndex из typeDefinitions
+    u64 tdoff = meta.sectionOff[19];
+    u64 tdcount = meta.sectionSize[19] / 0x58;
+    std::vector<u32> bys;
+    u64 step = std::max<u64>(1, tdcount / 64);
+    for (u64 T = 0; T < tdcount && bys.size() < 64; T += step) {
+        bys.push_back(rd32(meta.blob.data() + tdoff + T * 0x58 + 8));
+    }
+    if (bys.empty()) return 0;
+    u32 maxBy = *std::max_element(bys.begin(), bys.end());
+
+    auto validate = [&](u64 P) -> bool {
+        u64 q[16];
+        std::vector<u8> d;
+        if (!rt.read(P, sizeof(q), d)) return false;
+        for (int i = 0; i < 16; ++i) q[i] = rd64(d.data() + i * 8);
+        u64 cnt = q[6], arr = q[7];
+        if (cnt < 1000 || cnt > 800000 || cnt <= maxBy) return false;
+        if (!rt.mapped(arr)) return false;
+        // выборочная проверка typePtr[]
+        u64 stride = std::max<u64>(1, cnt / 48);
+        int good = 0, total = 0;
+        for (u64 i = 0; i < cnt; i += stride) {
+            std::vector<u8> e;
+            if (!rt.read(arr + i * 8, 8, e)) continue;
+            u64 tp = rd64(e.data());
+            u32 typ = 0;
+            ++total;
+            if (looksLikeType(res, tp, typ)) ++good;
+        }
+        if (total < 8 || good * 100 < total * 95) return false;
+        // byval-типы должны быть class/valueType (0x11/0x12)
+        int ok2 = 0, tot2 = 0;
+        for (u32 by : bys) {
+            if (by >= cnt) continue;
+            std::vector<u8> e;
+            if (!rt.read(arr + (u64)by * 8, 8, e)) continue;
+            u32 typ = 0;
+            ++tot2;
+            if (looksLikeType(res, rd64(e.data()), typ) && (typ == 0x11 || typ == 0x12)) ++ok2;
+        }
+        return tot2 > 0 && ok2 * 100 >= tot2 * 90;
+    };
+
+    // сегменты библиотеки
+    for (const auto& kv : res.segments) {
+        const auto& seg = kv.second;
+        u64 base = res.segRange.at(kv.first).first;
+        for (size_t i = 0; i + 0x80 <= seg.size(); i += 8) {
+            u64 cnt = rd64(seg.data() + i + 48);
+            if (cnt < 1000 || cnt > 800000) continue;
+            u64 P = base + i;
+            if (validate(P)) return P;
+        }
+    }
+    // куча
+    const auto& heap = res.heap;
+    for (size_t i = 0; i + 0x80 <= heap.size(); i += 8) {
+        u64 cnt = rd64(heap.data() + i + 48);
+        if (cnt < 1000 || cnt > 800000) continue;
+        u64 P = kHeapBase + i;
+        if (validate(P)) return P;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// runtime reader (emulated heap + library segments)
+// ---------------------------------------------------------------------------
+
 
 std::vector<u64> findModules(const EmuResult& res, const Metadata& meta) {
     RtReader rt(res);
@@ -167,6 +250,18 @@ bool buildRuntimeElf(const ElfFile& orig, const EmuResult& res, const Metadata& 
     out = orig.data;
     auto ph = loadPh(out);
 
+    // 0) динамически находим MetadataRegistration (без версионных констант)
+    {
+        u64 mr = findMetadataRegistration(res, meta);
+        if (!mr) {
+            std::fprintf(stderr, "[codereg] MetadataRegistration not found, fallback %#llx\n",
+                         (unsigned long long)META_REG);
+        } else {
+            META_REG = mr;
+            std::printf("[codereg] MetadataRegistration = %#llx\n", (unsigned long long)META_REG);
+        }
+    }
+
     // 1) overlay decrypted library segments (skip idx 0,1)
     for (const auto& kv : res.segments) {
         if (kv.first < 2) continue;
@@ -208,7 +303,7 @@ bool buildRuntimeElf(const ElfFile& orig, const EmuResult& res, const Metadata& 
             if (x.type == 1 && a >= x.pv && a < x.pv + x.pm) { off = x.po + (a - x.pv); return true; }
         return false;
     };
-    for (u64 a : {0x363418cull, 0x363419cull}) {
+    for (u64 a : {META_REG + 0x54, META_REG + 0x64}) {
         u64 off;
         if (v2o(a, off)) wr32(out.data() + off, 0);
     }
@@ -297,6 +392,35 @@ bool buildRuntimeElf(const ElfFile& orig, const EmuResult& res, const Metadata& 
         handleToIdx.emplace(dp, T);
     }
 
+    // выводим GENERIC_BASE/SIZE из data-указателей VAR/MVAR типов
+    {
+        u64 lo = ~0ull, hi = 0;
+        int nvars = 0;
+        for (u64 tp : typePtr) {
+            u64 to = 0;
+            if (!v2o(tp, to)) continue;
+            u64 dp = rd64(out.data() + to);
+            u32 bits = rd32(out.data() + to + 8);
+            u32 typ = (bits >> 16) & 0xFF;
+            if (typ == 0x13 || typ == 0x1E) {
+                ++nvars;
+                if (dp < lo) lo = dp;
+                if (dp > hi) hi = dp;
+            }
+        }
+        if (nvars >= 8 && lo != ~0ull && lo >= kHeapBase && hi - lo < 0x400000) {
+            u64 base = lo & ~0xFFull;
+            u64 size = ((hi - base) + 0x10 + 0xF) & ~0xF;
+            if (size >= 0x10 && size <= 0x200000) {
+                GENERIC_BASE = base;
+                GENERIC_SIZE = size;
+                std::printf("[codereg] generic table %#llx..%#llx (%llu bytes, %d vars)\n",
+                            (unsigned long long)GENERIC_BASE,
+                            (unsigned long long)(GENERIC_BASE + GENERIC_SIZE),
+                            (unsigned long long)GENERIC_SIZE, nvars);
+            }
+        }
+    }
     u64 genCount = GENERIC_SIZE / 0x10;
     u64 cls = 0, var = 0;
     for (u64 tp : typePtr) {

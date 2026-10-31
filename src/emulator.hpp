@@ -28,9 +28,9 @@ struct EmuResult {
 
 struct EmuOptions {
     // PGL/il2cpp entry (from the target batch). Auto-overridable.
-    u64 il2cppInit = 0x1686718;
+    u64 il2cppInit = 0x1688258;
     // Address whose mprotect() switches the packer into the il2cpp phase.
-    u64 initTrigger = 0x3522000;
+    u64 initTrigger = 0x3525000;
     // Max wall-clock seconds for the main loop.
     double maxSeconds = 360.0;
     bool verbose = false;
@@ -76,6 +76,7 @@ private:
     bool stop_ = false;
     bool doInit_ = false;
     bool verbose_ = false;
+    mutable int traceCount_ = 0;
     std::vector<Chunk> chunks_;
     std::vector<std::pair<u64, std::pair<u64, u64>>> mapped_;  // (start,end,phdr index)
     int ph5Index_ = -1;
@@ -83,6 +84,7 @@ private:
     double t0_ = 0;
 
     static bool isTargetChunksComplete(const Emulator& e);
+    u64 findMetadataInHeap() const;
 
     // setup
     void mapSegments();

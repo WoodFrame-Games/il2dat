@@ -25,14 +25,19 @@ static void usage() {
         "usage:\n"
         "  hypperdump full --out <dir> --apk base.apk --apk split_arm64.apk\n"
         "                  [--seconds N] [--verbose] [--cpp2il <exe>]\n"
+        "                  [--il2cpp-init <hex>] [--init-trigger <hex>]\n"
         "  hypperdump full --so <libil2cpp.so> --out <dir> [--seconds N]\n"
         "                  [--segments <dir>]   reuse an existing memory dump\n"
+        "                  [--il2cpp-init <hex>] [--init-trigger <hex>]\n"
         "  hypperdump emulate --so <libil2cpp.so> --apk <apk> --out <dir>\n"
         "\n"
         "  --apk may be given several times (base APK + split APK); the tool extracts\n"
         "  lib/arm64-v8a/libil2cpp.so, emulates the PGL unpacker, recovers\n"
         "  global-metadata.dat, builds a runtime ELF with the real CodeRegistration and\n"
-        "  writes real_method_pointers.tsv.\n");
+        "  writes real_method_pointers.tsv.\n"
+        "\n"
+        "  --il2cpp-init / --init-trigger override the build-specific PGL entry and\n"
+        "  il2cpp-phase trigger addresses (defaults: 0x1688258 / 0x3525000).\n");
 }
 
 struct Args {
@@ -40,6 +45,7 @@ struct Args {
     std::vector<std::string> apks;
     double seconds = 360.0;
     bool verbose = false;
+    unsigned long long il2cppInit = 0, initTrigger = 0;
 };
 
 static bool parseArgs(int argc, char** argv, Args& a) {
@@ -58,6 +64,8 @@ static bool parseArgs(int argc, char** argv, Args& a) {
         if (s == "--cpp2il") { val(a.cpp2il); continue; }
         if (s == "--verbose") { a.verbose = true; continue; }
         if (s == "--seconds") { if (i + 1 < argc) a.seconds = std::atof(argv[++i]); continue; }
+        if (s == "--il2cpp-init") { if (i + 1 < argc) a.il2cppInit = std::strtoull(argv[++i], nullptr, 0); continue; }
+        if (s == "--init-trigger") { if (i + 1 < argc) a.initTrigger = std::strtoull(argv[++i], nullptr, 0); continue; }
         std::fprintf(stderr, "unknown arg: %s\n", s.c_str());
         return false;
     }
@@ -108,6 +116,8 @@ static bool loadEmuResult(const std::string& dir, EmuResult& res) {
 static EmuResult runEmulator(ElfFile& elf, const Args& a) {
     EmuOptions opt;
     if (a.seconds > 0) opt.maxSeconds = a.seconds;
+    if (a.il2cppInit) opt.il2cppInit = a.il2cppInit;
+    if (a.initTrigger) opt.initTrigger = a.initTrigger;
     opt.verbose = a.verbose;
     Emulator emu(elf, opt);
     EmuResult res = emu.run();
